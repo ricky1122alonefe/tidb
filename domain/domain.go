@@ -241,7 +241,8 @@ func (do *Domain) SetLease(lease time.Duration) {
 	do.loadCh <- lease
 	// let ddl to reset lease too.
 	do.ddl.SetLease(lease)
-	do.SchemaValidity = newSchemaValidityInfo(lease)
+	// TODO: we should remove SetLease totally!!
+	do.SchemaValidity.(*schemaValidityInfo).setLease(lease)
 }
 
 // // Stats returns the domain statistic.
@@ -346,7 +347,9 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 				<-timer.C
 			}
 		}
-		timer.Reset(minInterval(lease))
+		if lease != 0 {
+			timer.Reset(minInterval(lease))
+		}
 	}
 }
 
@@ -460,6 +463,13 @@ func (s *schemaValidityInfo) Latest() int64 {
 	return s.latestSchemaVer
 }
 
+func (s *schemaValidityInfo) setLease(lease time.Duration) {
+	for k, v := range s.items {
+		s.items[k] = v.Add(lease)
+	}
+	s.lease += lease
+}
+
 // NewDomain creates a new domain. Should not create multiple domains for the same store.
 func NewDomain(store kv.Storage, lease time.Duration) (d *Domain, err error) {
 	d = &Domain{
@@ -487,10 +497,13 @@ func NewDomain(store kv.Storage, lease time.Duration) (d *Domain, err error) {
 
 // Domain error codes.
 const (
-	codeLoadSchemaTimeOut terror.ErrCode = 1
+	codeInfoSchemaExpired terror.ErrCode = 1
+	codeInfoSchemaChanged terror.ErrCode = 2
 )
 
 var (
-	// ErrLoadSchemaTimeOut returns for loading schema time out.
-	ErrLoadSchemaTimeOut = terror.ClassDomain.New(codeLoadSchemaTimeOut, "reload schema timeout")
+	// ErrInfoSchemaExpired returns the error that information schema is out of date.
+	ErrInfoSchemaExpired = terror.ClassDomain.New(codeInfoSchemaExpired, "Infomation schema is out of date.")
+	// ErrInfoSchemaChanged returns the error that information schema is changed.
+	ErrInfoSchemaChanged = terror.ClassDomain.New(codeInfoSchemaChanged, "Infomation schema is changed.")
 )

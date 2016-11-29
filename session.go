@@ -138,12 +138,24 @@ func (s *session) cleanRetryInfo() {
 
 // TODO: Set them as system variables.
 var (
-	checkSchemaValidityRetryTimes = 30
-	checkSchemaValiditySleepTime  = 1 * time.Second
+	schemaExpiredRetryTimes      = 30
+	checkSchemaValiditySleepTime = 1 * time.Second
 )
 
 // If the schema is invalid, we need to rollback the current transaction.
 func (s *session) checkSchemaValidOrRollback() error {
+	err := s.checkSchemaValid()
+	if err != nil {
+		err1 := s.RollbackTxn()
+		if err1 != nil {
+			// TODO: Handle this error.
+			log.Errorf("rollback txn failed, err:%v", errors.ErrorStack(err1))
+		}
+	}
+	return errors.Trace(err)
+}
+
+func (s *session) checkSchemaValid() error {
 	var ts uint64
 	if s.txn != nil {
 		ts = s.txn.StartTS()
@@ -166,10 +178,9 @@ func (s *session) checkSchemaValidOrRollback() error {
 	if err != nil {
 		// TODO: handle this error.
 		log.Errorf("[%d] rollback txn failed, err:%v", s.sessionVars.ConnectionID, errors.ErrorStack(err))
-		errMsg := fmt.Sprintf("schema is invalid, rollback txn err:%v", err.Error())
-		return domain.ErrLoadSchemaTimeOut.Gen(errMsg)
+		return errors.Trace(domain.ErrInfoSchemaExpired)
 	}
-	return errors.Trace(err)
+	return errors.Trace(domain.ErrInfoSchemaChanged)
 }
 
 func (s *session) Status() uint16 {
@@ -181,7 +192,7 @@ func (s *session) LastInsertID() uint64 {
 }
 
 func (s *session) AffectedRows() uint64 {
-	return s.sessionVars.AffectedRows
+	return s.sessionVars.StmtCtx.AffectedRows()
 }
 
 func (s *session) resetHistory() {
@@ -228,13 +239,30 @@ func (s *session) finishTxn(rollback bool) error {
 			s.txn.SetOption(kv.BinlogData, bin)
 		}
 	}
-	err := s.txn.Commit()
-	if err != nil {
-		if !s.sessionVars.RetryInfo.Retrying && kv.IsRetryableError(err) {
+
+	if err := s.checkSchemaValid(); err != nil {
+		if !s.sessionVars.RetryInfo.Retrying && s.isRetryableError(err) {
+			err = s.Retry()
+		} else {
+			err1 := s.txn.Rollback()
+			if err1 != nil {
+				// TODO: Handle this error.
+				log.Errorf("rollback txn failed, err:%v", errors.ErrorStack(err))
+			}
+		}
+		if err != nil {
+			log.Warnf("finished txn:%s, %v", s.txn, err)
+		}
+		s.resetHistory()
+		s.cleanRetryInfo()
+		return errors.Trace(err)
+	}
+	if err := s.txn.Commit(); err != nil {
+		if !s.sessionVars.RetryInfo.Retrying && s.isRetryableError(err) {
 			err = s.Retry()
 		}
 		if err != nil {
-			log.Warnf("txn:%s, %v", s.txn, err)
+			log.Warnf("finished txn:%s, %v", s.txn, err)
 			return errors.Trace(err)
 		}
 	}
@@ -245,10 +273,6 @@ func (s *session) finishTxn(rollback bool) error {
 }
 
 func (s *session) CommitTxn() error {
-	if err := s.checkSchemaValidOrRollback(); err != nil {
-		return errors.Trace(err)
-	}
-
 	return s.finishTxn(false)
 }
 
@@ -288,6 +312,10 @@ func (s *session) String() string {
 }
 
 const sqlLogMaxLen = 1024
+
+func (s *session) isRetryableError(err error) bool {
+	return kv.IsRetryableError(err) || terror.ErrorEqual(err, domain.ErrInfoSchemaChanged)
+}
 
 func (s *session) Retry() error {
 	log.Info("retry use schema version is:", s.schemaVerInCurrTxn)
@@ -330,7 +358,7 @@ func (s *session) Retry() error {
 			log.Info("or retry use schema version is:", s.schemaVerInCurrTxn)
 			_, err = runStmt(s, st)
 			if err != nil {
-				if kv.IsRetryableError(err) {
+				if s.isRetryableError(err) {
 					success = false
 					break
 				}
@@ -340,7 +368,7 @@ func (s *session) Retry() error {
 		}
 		if success {
 			err = s.CommitTxn()
-			if !kv.IsRetryableError(err) {
+			if !s.isRetryableError(err) {
 				break
 			}
 		}
@@ -353,8 +381,10 @@ func (s *session) Retry() error {
 	return err
 }
 
-// ExecRestrictedSQL implements SQLHelper interface.
-// This is used for executing some restricted sql statements.
+// ExecRestrictedSQL implements RestrictedSQLExecutor interface.
+// This is used for executing some restricted sql statements, usually executed during a normal statement execution.
+// Unlike normal Exec, it doesn't reset statement status, doesn't commit or rollback the current transaction
+// and doesn't write binlog.
 func (s *session) ExecRestrictedSQL(ctx context.Context, sql string) (ast.RecordSet, error) {
 	if err := s.checkSchemaValidOrRollback(); err != nil {
 		return nil, errors.Trace(err)
@@ -368,6 +398,7 @@ func (s *session) ExecRestrictedSQL(ctx context.Context, sql string) (ast.Record
 		log.Errorf("ExecRestrictedSQL only executes one statement. Too many/few statement in %s", sql)
 		return nil, errors.New("wrong number of statement")
 	}
+	// Some execution is done in compile stage, so we reset it before compile.
 	st, err := Compile(s, rawStmts[0])
 	if err != nil {
 		log.Errorf("Compile %s with error: %v", sql, err)
@@ -464,6 +495,8 @@ func (s *session) Execute(sql string) ([]ast.RecordSet, error) {
 	ph := sessionctx.GetDomain(s).PerfSchema()
 	for i, rst := range rawStmts {
 		startTS := time.Now()
+		// Some execution is done in compile stage, so we reset it before compile.
+		resetStmtStatus(s, rawStmts[0])
 		st, err1 := Compile(s, rst)
 		if err1 != nil {
 			log.Warnf("[%d] compile error:\n%v\n%s", connID, err1, sql)
@@ -545,7 +578,7 @@ func checkArgs(args ...interface{}) error {
 		case time.Duration:
 			args[i] = types.Duration{Duration: x}
 		case time.Time:
-			args[i] = types.Time{Time: x, Type: mysql.TypeDatetime}
+			args[i] = types.Time{Time: types.FromGoTime(x), Type: mysql.TypeDatetime}
 		case nil:
 		default:
 			return errors.Errorf("cannot use arg[%d] (type %T):unsupported type", i, v)
@@ -564,7 +597,7 @@ func (s *session) ExecutePreparedStmt(stmtID uint32, args ...interface{}) (ast.R
 		return nil, errors.Trace(err)
 	}
 	st := executor.CompileExecutePreparedStmt(s, stmtID, args...)
-	r, err := runStmt(s, st, args...)
+	r, err := runStmt(s, st)
 	return r, errors.Trace(err)
 }
 
