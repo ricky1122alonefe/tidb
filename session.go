@@ -148,31 +148,25 @@ func (s *session) checkSchemaValidOrRollback() error {
 	if s.txn != nil {
 		ts = s.txn.StartTS()
 	} else {
-		s.schemaVerInCurrTxn = 0
+		// log.Info("transaction is null, so set schemaVerInCurrTxn to 0!!!")
+		// s.schemaVerInCurrTxn = 0
 	}
 
-	var err error
-	var currSchemaVer int64
-	for i := 0; i < checkSchemaValidityRetryTimes; i++ {
-		currSchemaVer, err = sessionctx.GetDomain(s).SchemaValidity.Check(ts, s.schemaVerInCurrTxn)
-		if err == nil {
-			if s.txn == nil {
-				s.schemaVerInCurrTxn = currSchemaVer
-			}
-			return nil
-		}
-		log.Infof("schema version original %d, current %d, sleep time %v",
-			s.schemaVerInCurrTxn, currSchemaVer, checkSchemaValiditySleepTime)
-		if currSchemaVer != s.schemaVerInCurrTxn && s.schemaVerInCurrTxn != 0 {
-			break
-		}
-		time.Sleep(checkSchemaValiditySleepTime)
+	schemaValidity := sessionctx.GetDomain(s).SchemaValidity
+	if schemaValidity.Check(ts, s.schemaVerInCurrTxn) {
+		return nil
 	}
 
-	if err1 := s.RollbackTxn(); err1 != nil {
+
+	old := s.schemaVerInCurrTxn
+	s.schemaVerInCurrTxn = schemaValidity.Latest()
+	log.Infof("schema version %d expired, update it to %d", old, s.schemaVerInCurrTxn)
+
+	err := s.RollbackTxn()
+	if err != nil {
 		// TODO: handle this error.
-		log.Errorf("[%d] rollback txn failed, err:%v", s.sessionVars.ConnectionID, errors.ErrorStack(err1))
-		errMsg := fmt.Sprintf("schema is invalid, rollback txn err:%v", err1.Error())
+		log.Errorf("[%d] rollback txn failed, err:%v", s.sessionVars.ConnectionID, errors.ErrorStack(err))
+		errMsg := fmt.Sprintf("schema is invalid, rollback txn err:%v", err.Error())
 		return domain.ErrLoadSchemaTimeOut.Gen(errMsg)
 	}
 	return errors.Trace(err)
@@ -296,6 +290,7 @@ func (s *session) String() string {
 const sqlLogMaxLen = 1024
 
 func (s *session) Retry() error {
+	log.Info("retry use schema version is:", s.schemaVerInCurrTxn)
 	s.sessionVars.RetryInfo.Retrying = true
 	nh := s.history.clone()
 	// Debug infos.
@@ -332,6 +327,7 @@ func (s *session) Retry() error {
 				txt = txt[:sqlLogMaxLen]
 			}
 			log.Warnf("Retry %s (len:%d)", txt, len(st.OriginText()))
+			log.Info("or retry use schema version is:", s.schemaVerInCurrTxn)
 			_, err = runStmt(s, st)
 			if err != nil {
 				if kv.IsRetryableError(err) {

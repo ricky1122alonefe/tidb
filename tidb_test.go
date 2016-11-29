@@ -318,7 +318,8 @@ func (s *testMainSuite) TestSchemaValidity(c *C) {
 	default:
 	}
 	// Make sure loading information schema is failed and server is invalid.
-	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(true)
+	// sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(true)
+	sessionctx.GetDomain(ctx).MockReloadFailed.SetValue(true)
 	sessionctx.GetDomain(ctx).Reload()
 	lease := sessionctx.GetDomain(ctx).DDL().GetLease()
 	time.Sleep(lease)
@@ -341,8 +342,8 @@ func (s *testMainSuite) TestSchemaValidity(c *C) {
 	ver, err := store.CurrentVersion()
 	c.Assert(err, IsNil)
 	c.Assert(ver, NotNil)
-	sessionctx.GetDomain(ctx).SchemaValidity.SetExpireInfo(false, ver.Ver)
-	sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(false)
+	// sessionctx.GetDomain(ctx).SchemaValidity.SetExpireInfo(false, ver.Ver)
+	// sessionctx.GetDomain(ctx).SchemaValidity.MockReloadFailed.SetValue(false)
 	mustExecSQL(c, se, "insert t values (1);")
 	// Make sure insert to table t2 transaction executes.
 	startCh2 <- struct{}{}

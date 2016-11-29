@@ -97,6 +97,7 @@ var (
 // SetSchemaLease only affects not local storage after bootstrapped.
 func SetSchemaLease(lease time.Duration) {
 	schemaLease = lease
+	log.Info("Set Schema Lease: ", schemaLease)
 }
 
 // Parse parses a query string to raw ast.StmtNode.
