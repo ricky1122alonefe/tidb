@@ -56,6 +56,9 @@ func (d Driver) Open(path string) (kv.Storage, error) {
 
 	pdCli, err := pd.NewClient(etcdAddrs)
 	if err != nil {
+		if strings.Contains(err.Error(), "i/o timeout") {
+			return nil, errors.Annotate(err, txnRetryableMark)
+		}
 		return nil, errors.Trace(err)
 	}
 
@@ -116,7 +119,8 @@ func NewMockTikvStore() (kv.Storage, error) {
 	mvccStore := mocktikv.NewMvccStore()
 	client := mocktikv.NewRPCClient(cluster, mvccStore)
 	uuid := fmt.Sprintf("mock-tikv-store-:%v", time.Now().Unix())
-	return newTikvStore(uuid, mocktikv.NewPDClient(cluster), client, false)
+	pdCli := &codecPDClient{mocktikv.NewPDClient(cluster)}
+	return newTikvStore(uuid, pdCli, client, false)
 }
 
 func (s *tikvStore) Begin() (kv.Transaction, error) {
